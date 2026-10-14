@@ -1,0 +1,232 @@
+AEGISOS SOURCE REVIEW
+
+
+================ backend\main.py ================
+
+import json, uuid
+from datetime import datetime, timezone
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from database.db import connect, init_db
+from models.schemas import EventIn, SimulateRequest, ResponseAction
+from simulator.generator import generate
+from detection.rules import detect
+from detection.correlation import correlate
+from detection.risk import score
+from detection.anomaly import anomaly_score
+from ai.investigator import investigate
+
+app=FastAPI(title='AegisOS API', version='1.0.0')
+app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+init_db()
+
+def save_events(events):
+    conn=connect(); ids=[]
+    for e in events:
+        cur=conn.execute('''INSERT INTO events(timestamp,event_type,user,source_ip,destination_ip,device,country,action,resource,bytes_out,success,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+        (e['timestamp'],e['event_type'],e.get('user'),e.get('source_ip'),e.get('destination_ip'),e.get('device'),e.get('country'),e.get('action'),e.get('resource'),e.get('bytes_out',0),int(e.get('success',True)),json.dumps(e.get('metadata',{}))))
+        ids.append(cur.lastrowid)
+    conn.commit(); conn.close()
+    for e,i in zip(events,ids): e['id']=i
+    return events
+
+def process(events):
+    alerts=detect(events)
+    anomaly=anomaly_score(events)
+    incidents=correlate(events,alerts)
+    created=[]
+    conn=connect()
+    for group in incidents:
+        risk,severity,reasons=score(group['alerts'],anomaly)
+        key=f"{group['user']}|{group['source_ip']}|{datetime.now().strftime('%Y%m%d%H%M')}"
+        summary=investigate(group,events,reasons)['bluf']
+        mitre=[]
+        types={a['type'] for a in group['alerts']}
+        if 'BRUTE_FORCE' in types: mitre.append('T1110 - Brute Force')
+        if 'SUSPICIOUS_LOGIN' in types: mitre.append('T1078 - Valid Accounts')
+        if 'PRIVILEGE_ESCALATION' in types: mitre.append('T1068 - Exploitation for Privilege Escalation')
+        if 'POSSIBLE_EXFILTRATION' in types: mitre.append('T1041 - Exfiltration Over C2 Channel')
+        try:
+            cur=conn.execute('''INSERT INTO incidents(incident_key,title,severity,risk_score,status,user,source_ip,summary,mitre,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)''',
+            (key,'; '.join(sorted(types)),severity,risk,'OPEN',group['user'],group['source_ip'],summary,json.dumps(mitre),datetime.now(timezone.utc).isoformat()))
+            iid=cur.lastrowid
+            for eid in group['event_ids']:
+                conn.execute('INSERT OR IGNORE INTO incident_events(incident_id,event_id) VALUES(?,?)',(iid,eid))
+            created.append({'id':iid,'title':'; '.join(sorted(types)),'severity':severity,'risk_score':risk,'status':'OPEN','user':group['user'],'source_ip':group['source_ip'],'summary':summary,'mitre':mitre,'reasons':reasons})
+        except Exception:
+            pass
+    conn.commit(); conn.close()
+    return {'events_created':len(events),'alerts':alerts,'anomaly_score':anomaly,'incidents':created}
+
+@app.get('/api/health')
+def health(): return {'status':'ok','service':'AegisOS'}
+
+@app.post('/api/events')
+def create_event(e:EventIn):
+    saved=save_events([e.model_dump()]); result=process(saved); return {'event':saved[0],'analysis':result}
+
+@app.get('/api/events')
+def list_events(limit:int=200):
+    conn=connect(); rows=[dict(r) for r in conn.execute('SELECT * FROM events ORDER BY id DESC LIMIT ?', (min(limit,1000),)).fetchall()]; conn.close(); return rows
+
+@app.post('/api/simulator/generate')
+def simulator(req:SimulateRequest):
+    rows=save_events(generate(req.scenario,req.count)); return process(rows)
+
+@app.get('/api/incidents')
+def list_incidents():
+    conn=connect(); rows=[dict(r) for r in conn.execute('SELECT * FROM incidents ORDER BY id DESC').fetchall()]; conn.close()
+    for r in rows: r['mitre']=json.loads(r['mitre'] or '[]')
+    return rows
+
+@app.get('/api/incidents/{incident_id}')
+def incident_detail(incident_id:int):
+    conn=connect(); inc=conn.execute('SELECT * FROM incidents WHERE id=?',(incident_id,)).fetchone()
+    if not inc: return {'error':'Incident not found'}
+    data=dict(inc); data['mitre']=json.loads(data['mitre'] or '[]')
+    events=[dict(r) for r in conn.execute('SELECT e.* FROM events e JOIN incident_events ie ON e.id=ie.event_id WHERE ie.incident_id=? ORDER BY e.timestamp',(incident_id,)).fetchall()]
+    conn.close()
+    alerts=detect(events); group={'user':data['user'],'source_ip':data['source_ip'],'alerts':alerts}
+    return {**data,'events':events,'investigation':investigate(group,events,[]) }
+
+@app.post('/api/incidents/{incident_id}/response')
+def response_action(incident_id:int, req:ResponseAction):
+    return {'incident_id':incident_id,'action':req.action,'mode':'SIMULATION','message':f'{req.action.replace("_"," ").title()} would be executed in a connected environment. No real system was modified.'}
+
+@app.get('/api/metrics')
+def metrics():
+    conn=connect()
+    total=conn.execute('SELECT COUNT(*) c FROM events').fetchone()['c']; incidents=conn.execute('SELECT COUNT(*) c FROM incidents').fetchone()['c']; critical=conn.execute("SELECT COUNT(*) c FROM incidents WHERE severity='CRITICAL'").fetchone()['c']; open_i=conn.execute("SELECT COUNT(*) c FROM incidents WHERE status='OPEN'").fetchone()['c'];
+    conn.close(); return {'events':total,'incidents':incidents,'critical':critical,'open_incidents':open_i,'users':5}
+
+
+
+================ backend\requirements.txt ================
+
+
+
+================ backend\database\db.py ================
+
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path(__file__).resolve().parents[2] / "data" / "aegisos.db"
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = connect()
+    conn.executescript('''
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        user TEXT,
+        source_ip TEXT,
+        destination_ip TEXT,
+        device TEXT,
+        country TEXT,
+        action TEXT,
+        resource TEXT,
+        bytes_out INTEGER DEFAULT 0,
+        success INTEGER DEFAULT 1,
+        metadata TEXT DEFAULT '{}'
+    );
+    CREATE TABLE IF NOT EXISTS incidents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        incident_key TEXT UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        risk_score INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'OPEN',
+        user TEXT,
+        source_ip TEXT,
+        summary TEXT,
+        mitre TEXT DEFAULT '[]',
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS incident_events (
+        incident_id INTEGER,
+        event_id INTEGER,
+        PRIMARY KEY (incident_id,event_id)
+    );
+    ''')
+    conn.commit()
+    conn.close()
+
+
+
+================ backend\detection\rules.py ================
+
+
+
+================ backend\detection\risk.py ================
+
+WEIGHTS = {
+    'BRUTE_FORCE':15,'SUSPICIOUS_LOGIN':20,'PRIVILEGE_ESCALATION':25,
+    'SENSITIVE_ACCESS':20,'POSSIBLE_EXFILTRATION':30,'SUSPICIOUS_EXECUTION':20
+}
+
+def score(alerts, anomaly=0):
+    reasons=[]
+    total=0
+    seen=set()
+    for a in alerts:
+        t=a['type']
+        if t not in seen:
+            w=WEIGHTS.get(t,10); total += w; seen.add(t)
+            reasons.append({'label':a['reason'],'points':w})
+    if anomaly > 0.7:
+        total += 10
+        reasons.append({'label':'Behavioral anomaly score exceeded 0.70','points':10})
+    total=min(100,total)
+    severity='CRITICAL' if total>=80 else 'HIGH' if total>=60 else 'MEDIUM' if total>=30 else 'LOW'
+    return total,severity,reasons
+
+
+
+================ backend\detection\anomaly.py ================
+
+import numpy as np
+from sklearn.ensemble import IsolationForest
+
+def anomaly_score(events):
+    if not events: return 0.0
+    X=[]
+    for e in events:
+        X.append([
+            1 if e.get('event_type')=='LOGIN_FAILED' else 0,
+            1 if e.get('event_type')=='PRIVILEGE_CHANGE' else 0,
+            1 if e.get('event_type') in ('SENSITIVE_FILE_ACCESS','DATA_TRANSFER') else 0,
+            min(int(e.get('bytes_out',0))/1_000_000_000, 10),
+            1 if e.get('country') in {'Russia','China','North Korea'} else 0
+        ])
+    if len(X)<10: return 0.0
+    model=IsolationForest(contamination='auto', random_state=42)
+    pred=model.fit_predict(np.array(X))
+    return round(float(np.mean(pred==-1)),3)
+
+
+
+================ backend\ai\investigator.py ================
+
+def investigate(incident, events, reasons):
+    user=incident.get('user','unknown'); ip=incident.get('source_ip','unknown')
+    types=[a['type'] for a in incident.get('alerts',[])]
+    title='Possible security incident'
+    if 'BRUTE_FORCE' in types and 'PRIVILEGE_ESCALATION' in types: title='Possible account takeover with privilege escalation'
+    elif 'POSSIBLE_EXFILTRATION' in types: title='Possible data exfiltration'
+    elif 'BRUTE_FORCE' in types: title='Possible brute-force attack'
+    elif 'PRIVILEGE_ESCALATION' in types: title='Possible privilege escalation'
+    summary=f'{title} involving user {user} and source {ip}. AegisOS correlated multiple security signals instead of treating them as isolated alerts.'
+    evidence=[a['reason'] for a in incident.get('alerts',[])]
+    recommendations=['Review the affected account and recent authentication history','Revoke active sessions if compromise is suspected','Force a password reset for the affected user','Investigate the source IP and related devices']
+    if 'POSSIBLE_EXFILTRATION' in types: recommendations.insert(0,'Preserve outbound-transfer evidence and review accessed data')
+    return {'title':title,'bluf':summary,'evidence':evidence,'recommendations':recommendations,'confidence':min(98,70+len(types)*7)}
+
